@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
+use std::path::Path;
 use std::pin::pin;
 
 use archive_it_client::wasapi::DEFAULT_WEBDATA_PAGE_SIZE;
@@ -27,6 +28,15 @@ const HEADER: [&str; 14] = [
     "all_locations",
 ];
 
+/// Resume state derived from an existing inventory CSV.
+#[derive(Debug, Default)]
+struct CacheState {
+    /// Cached file count per collection_id.
+    counts: HashMap<u64, u64>,
+    /// (collection_id, filename) of rows already in the CSV.
+    seen: HashSet<(u64, String)>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user =
@@ -40,10 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let header_needed = std::fs::metadata(OUTPUT_PATH)
         .map(|m| m.len() == 0)
         .unwrap_or(true);
-    let (cache_counts, seen) = if header_needed {
-        (HashMap::new(), HashSet::new())
+    let CacheState {
+        counts: cache_counts,
+        mut seen,
+    } = if header_needed {
+        CacheState::default()
     } else {
-        read_cache_state(OUTPUT_PATH)?
+        read_cache_state(Path::new(OUTPUT_PATH))?
     };
     if !seen.is_empty() {
         eprintln!(
@@ -137,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if file.filetype != "warc" {
                     continue;
                 }
-                if seen.contains(&file.filename) {
+                if !seen.insert((collection.id, file.filename.clone())) {
                     cached_this_page += 1;
                     continue;
                 }
@@ -215,24 +228,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn read_cache_state(path: &str) -> Result<(HashMap<u64, u64>, HashSet<String>), csv::Error> {
+fn read_cache_state(path: &Path) -> Result<CacheState, csv::Error> {
     let mut rdr = ReaderBuilder::new().has_headers(true).from_path(path)?;
-    let mut counts: HashMap<u64, u64> = HashMap::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut state = CacheState::default();
     for record in rdr.records() {
         let record = record?;
-        if let Some(id_str) = record.get(COLLECTION_ID_COL)
-            && let Ok(id) = id_str.parse::<u64>()
-        {
-            *counts.entry(id).or_insert(0) += 1;
+        let Some(id_str) = record.get(COLLECTION_ID_COL) else {
+            continue;
+        };
+        let Ok(collection_id) = id_str.parse::<u64>() else {
+            continue;
+        };
+        let Some(filename) = record.get(FILENAME_COL) else {
+            continue;
+        };
+        if filename.is_empty() {
+            continue;
         }
-        if let Some(filename) = record.get(FILENAME_COL)
-            && !filename.is_empty()
-        {
-            seen.insert(filename.to_owned());
+
+        if state.seen.insert((collection_id, filename.to_owned())) {
+            *state.counts.entry(collection_id).or_insert(0) += 1;
         }
     }
-    Ok((counts, seen))
+    Ok(state)
 }
 
 fn opt_string(value: Option<String>) -> String {
