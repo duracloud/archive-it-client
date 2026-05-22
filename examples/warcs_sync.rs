@@ -14,7 +14,7 @@ use archive_it_client::models::wasapi::{Checksums, WasapiFile};
 use archive_it_client::{DownloadOutcome, Error, WasapiClient};
 use aws_config::BehaviorVersion;
 use csv::ReaderBuilder;
-use futures::TryStreamExt;
+use futures::StreamExt;
 
 const SYNC_PATH: &str = "warcs_sync.csv";
 
@@ -74,45 +74,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut stream =
             pin!(client.download_to_s3(file, s3.clone(), bucket.clone(), prefix.clone()));
         let mut showed_progress = false;
-        loop {
-            match stream.try_next().await {
-                Ok(Some(outcome)) => {
-                    let is_progress = matches!(outcome, DownloadOutcome::Progress { .. });
-                    if is_progress {
-                        print!("\r\x1b[2K{outcome}");
-                        io::stdout().flush()?;
-                        showed_progress = true;
-                        continue;
-                    }
-                    if showed_progress {
-                        println!();
-                        showed_progress = false;
-                    }
-                    println!("{outcome}");
-                    match outcome {
-                        DownloadOutcome::Downloaded { .. } => uploaded += 1,
-                        DownloadOutcome::Skipped { .. } => skipped += 1,
-                        DownloadOutcome::Failed { error, .. } => {
-                            if matches!(error, Error::NotFound(_)) {
-                                wasapi_missing += 1;
-                            } else {
-                                failed += 1;
-                            }
-                        }
-                        DownloadOutcome::Progress { .. } => unreachable!(),
+        while let Some(outcome) = stream.next().await {
+            let is_progress = matches!(outcome, DownloadOutcome::Progress { .. });
+            if is_progress {
+                print!("\r\x1b[2K{outcome}");
+                io::stdout().flush()?;
+                showed_progress = true;
+                continue;
+            }
+            if showed_progress {
+                println!();
+                showed_progress = false;
+            }
+            println!("{outcome}");
+            match outcome {
+                DownloadOutcome::Downloaded { .. } => uploaded += 1,
+                DownloadOutcome::Skipped { .. } => skipped += 1,
+                DownloadOutcome::Failed { error, .. } => {
+                    if matches!(error, Error::NotFound(_)) {
+                        wasapi_missing += 1;
+                    } else {
+                        failed += 1;
                     }
                 }
-                Ok(None) => break,
-                // Per-file errors come back as `DownloadOutcome::Failed`;
-                // this arm only fires for a stream-level fault.
-                Err(e) => {
-                    if showed_progress {
-                        println!();
-                    }
+                DownloadOutcome::StreamFailed { error } => {
                     failed += 1;
-                    eprintln!("stream error: {e}");
-                    break;
+                    eprintln!("stream error: {error}");
                 }
+                DownloadOutcome::Progress { .. } => unreachable!(),
             }
         }
     }

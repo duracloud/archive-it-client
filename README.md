@@ -163,14 +163,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Two destinations: local filesystem and S3. Both skip the fetch when the
 destination already matches — by sha1 when WASAPI supplied one, otherwise
 by file size. Every download method returns a `Stream` of `DownloadOutcome`
-events — `Progress` / `Downloaded` / `Skipped` / `Failed` per file — so
-callers can render progress and react to per-file failures uniformly,
-whether they're downloading one file or a whole collection.
+events — `Progress` / `Downloaded` / `Skipped` / `Failed` per file, plus
+`StreamFailed` for errors that occur before a file is available — so callers
+can render progress and react to failures uniformly, whether they're
+downloading one file or a whole collection.
 
 ```rust,no_run
 use std::pin::pin;
 use archive_it_client::{WasapiClient, WebdataQuery};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -184,14 +185,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))
     .try_next().await?.ok_or("empty")?;
     let mut single = pin!(wasapi.download(file, "./out.warc.gz"));
-    while let Some(outcome) = single.try_next().await? {
+    while let Some(outcome) = single.next().await {
         println!("{outcome}");
     }
 
     // whole collection → ./warcs, also a stream of outcomes per file
     let query = WebdataQuery { collection: Some(4472), ..Default::default() };
     let mut stream = pin!(wasapi.download_collection(query, "./warcs"));
-    while let Some(outcome) = stream.try_next().await? {
+    while let Some(outcome) = stream.next().await {
         println!("{outcome}");
     }
     Ok(())

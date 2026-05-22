@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::pin;
 
 use archive_it_client::{DownloadOutcome, WasapiClient, WebdataQuery};
-use futures::TryStreamExt;
+use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = pin!(client.download_collection(query, &dir));
     let mut showed_progress = false;
-    while let Some(outcome) = stream.try_next().await? {
+    while let Some(outcome) = stream.next().await {
         match &outcome {
             DownloadOutcome::Progress { .. } => {
                 print!("\r\x1b[2K{outcome}");

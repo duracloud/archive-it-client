@@ -4,7 +4,7 @@ use std::pin::pin;
 
 use archive_it_client::{DownloadOutcome, WasapiClient, WebdataQuery};
 use aws_config::BehaviorVersion;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = pin!(client.download_to_s3(file, s3, bucket, prefix));
     let mut showed_progress = false;
-    while let Some(outcome) = stream.try_next().await? {
+    while let Some(outcome) = stream.next().await {
         match &outcome {
             DownloadOutcome::Progress { .. } => {
                 print!("\r\x1b[2K{outcome}");
