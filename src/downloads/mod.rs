@@ -44,24 +44,6 @@ pub(crate) trait SinkFactory: Send {
     -> impl Future<Output = Result<Self::Sink, Error>> + Send;
 }
 
-#[derive(Debug)]
-pub(crate) enum DownloadEvent<L> {
-    Progress {
-        file: WasapiFile,
-        received: u64,
-        total: u64,
-    },
-    Skipped {
-        file: WasapiFile,
-        location: L,
-    },
-    Downloaded {
-        file: WasapiFile,
-        location: L,
-        verified: bool,
-    },
-}
-
 /// Renders a download destination for log lines.
 ///
 /// Implemented by location types used with `DownloadOutcome<L>`, such as
@@ -77,8 +59,10 @@ impl DownloadLocation for PathBuf {
 }
 
 /// Public per-file outcome surfaced to callers of every `WasapiClient::download*`
-/// method. `Failed` carries the error so a single bad file in a collection (or
-/// a one-shot singular download) doesn't tear down the whole stream.
+/// method. `Failed` carries per-file errors so a single bad file in a
+/// collection doesn't tear down the whole stream. `StreamFailed` carries
+/// errors that happen before a file is available, such as a failed collection
+/// listing request or destination preflight.
 #[derive(Debug)]
 pub enum DownloadOutcome<L = PathBuf> {
     Downloaded {
@@ -98,6 +82,9 @@ pub enum DownloadOutcome<L = PathBuf> {
     Skipped {
         file: WasapiFile,
         location: L,
+    },
+    StreamFailed {
+        error: Error,
     },
 }
 
@@ -141,6 +128,7 @@ impl<L: DownloadLocation> fmt::Display for DownloadOutcome<L> {
                 location.fmt_location(f)?;
                 write!(f, " (already present)")
             }
+            Self::StreamFailed { error } => write!(f, "stream failed: {error}"),
         }
     }
 }
@@ -152,30 +140,6 @@ pub(crate) enum Prepared<L> {
     /// hashing from `partial_sha1`. `received == file.size` is valid and means
     /// the engine skips the byte fetch and goes straight to finalize.
     Resume { received: u64, partial_sha1: Sha1 },
-}
-
-fn outcome_from<L>(event: DownloadEvent<L>) -> DownloadOutcome<L> {
-    match event {
-        DownloadEvent::Progress {
-            file,
-            received,
-            total,
-        } => DownloadOutcome::Progress {
-            file,
-            received,
-            total,
-        },
-        DownloadEvent::Skipped { file, location } => DownloadOutcome::Skipped { file, location },
-        DownloadEvent::Downloaded {
-            file,
-            location,
-            verified,
-        } => DownloadOutcome::Downloaded {
-            file,
-            location,
-            verified,
-        },
-    }
 }
 
 /// Resolve the WARC URL for `file`. Free fn so the driver doesn't need to
@@ -192,24 +156,31 @@ pub(crate) fn primary_location_url(primary_src: &str, file: &WasapiFile) -> Resu
 }
 
 /// One driver for every download path. Pulls files from the input stream,
-/// asks the factory for a per-file sink, runs `run_download`, and maps each
-/// internal event to a public `DownloadOutcome`. Per-file errors (sink build,
-/// url resolution, transport failure) yield `Failed` and the loop continues
-/// to the next file — a one-element file stream therefore yields exactly one
-/// terminal outcome.
+/// asks the factory for a per-file sink, and runs `run_download`. Per-file
+/// errors (sink build, url resolution, transport failure) yield `Failed` and
+/// the loop continues to the next file — a one-element file stream therefore
+/// yields exactly one terminal outcome.
 pub(crate) fn drive<'a, F>(
     transport: &'a Transport,
     primary_src: &'a str,
     files: impl Stream<Item = Result<WasapiFile, Error>> + Send + 'a,
     factory: F,
-) -> impl Stream<Item = Result<DownloadOutcome<F::Location>, Error>> + Send + 'a
+) -> impl Stream<Item = DownloadOutcome<F::Location>> + Send + 'a
 where
     F: SinkFactory + 'a,
 {
-    async_stream::try_stream! {
+    async_stream::stream! {
         let mut factory = factory;
         let mut files = pin!(files);
-        while let Some(file) = files.try_next().await? {
+        loop {
+            let file = match files.try_next().await {
+                Ok(Some(file)) => file,
+                Ok(None) => break,
+                Err(error) => {
+                    yield DownloadOutcome::StreamFailed { error };
+                    return;
+                }
+            };
             let sink = match factory.make(&file).await {
                 Ok(s) => s,
                 Err(error) => {
@@ -228,7 +199,7 @@ where
             let mut events = pin!(run_download(transport, url, file, sink));
             loop {
                 match events.try_next().await {
-                    Ok(Some(event)) => yield outcome_from(event),
+                    Ok(Some(outcome)) => yield outcome,
                     Ok(None) => break,
                     Err(error) => {
                         yield DownloadOutcome::Failed {
@@ -243,12 +214,16 @@ where
     }
 }
 
+/// Streams one file's download. Only emits the happy-path `DownloadOutcome`
+/// variants (`Progress`, `Skipped`, `Downloaded`); per-file faults bubble out
+/// as `Err` and `drive` turns them into `Failed`. `StreamFailed` is never
+/// produced here — it's reserved for pre-file errors at the `drive` layer.
 pub(crate) fn run_download<S>(
     transport: &Transport,
     url: Url,
     file: WasapiFile,
     sink: S,
-) -> impl Stream<Item = Result<DownloadEvent<S::Location>, Error>> + Send + '_
+) -> impl Stream<Item = Result<DownloadOutcome<S::Location>, Error>> + Send + '_
 where
     S: Sink + Send + 'static,
 {
@@ -258,7 +233,7 @@ where
 
         let (mut received, mut hasher) = match sink.prepare(&file).await? {
             Prepared::Skip { location } => {
-                yield DownloadEvent::Skipped { file, location };
+                yield DownloadOutcome::Skipped { file, location };
                 return;
             }
             Prepared::Resume { received, partial_sha1 } => (received, partial_sha1),
@@ -269,7 +244,7 @@ where
         let mut delay = transport.backoff();
 
         if received > 0 && received < file.size {
-            yield DownloadEvent::Progress {
+            yield DownloadOutcome::Progress {
                 file: file.clone(),
                 received,
                 total: file.size,
@@ -329,7 +304,7 @@ where
                     Some(t) => t.elapsed() >= PROGRESS_INTERVAL,
                 };
                 if emit {
-                    yield DownloadEvent::Progress {
+                    yield DownloadOutcome::Progress {
                         file: file.clone(),
                         received,
                         total: file.size,
@@ -362,6 +337,6 @@ where
         };
 
         let location = sink.finalize().await?;
-        yield DownloadEvent::Downloaded { file, location, verified };
+        yield DownloadOutcome::Downloaded { file, location, verified };
     }
 }

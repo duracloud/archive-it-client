@@ -3,7 +3,7 @@ use std::pin::pin;
 
 use aws_sdk_s3::Client as AwsS3Client;
 use futures_core::Stream;
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use serde::Serialize;
 
 use crate::downloads::local::{LocalDir, LocalPath};
@@ -87,13 +87,12 @@ impl WasapiClient {
         &self,
         file: WasapiFile,
         path: impl AsRef<Path>,
-    ) -> impl Stream<Item = Result<DownloadOutcome, Error>> + Send + '_ {
+    ) -> impl Stream<Item = DownloadOutcome> + Send + '_ {
         let path = path.as_ref().to_path_buf();
-        let files = async_stream::try_stream! { yield file; };
         downloads::drive(
             &self.transport,
             &self.primary_location_src,
-            files,
+            single_file(file),
             LocalPath { path },
         )
     }
@@ -102,13 +101,18 @@ impl WasapiClient {
         &self,
         query: WebdataQuery,
         dir: impl Into<PathBuf>,
-    ) -> impl Stream<Item = Result<DownloadOutcome, Error>> + Send + '_ {
+    ) -> impl Stream<Item = DownloadOutcome> + Send + '_ {
         let dir = dir.into();
-        async_stream::try_stream! {
+        async_stream::stream! {
             // Preflight the destination once so a bad output path fails the
             // stream upfront instead of yielding one Failed per file. Also
             // ensures the directory exists when the collection is empty.
-            tokio::fs::create_dir_all(&dir).await?;
+            if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+                yield DownloadOutcome::StreamFailed {
+                    error: Error::from(error),
+                };
+                return;
+            }
             let inner = downloads::drive(
                 &self.transport,
                 &self.primary_location_src,
@@ -116,7 +120,7 @@ impl WasapiClient {
                 LocalDir { dir },
             );
             let mut inner = pin!(inner);
-            while let Some(outcome) = inner.try_next().await? {
+            while let Some(outcome) = inner.next().await {
                 yield outcome;
             }
         }
@@ -128,12 +132,11 @@ impl WasapiClient {
         s3: AwsS3Client,
         bucket: impl Into<String>,
         prefix: Option<String>,
-    ) -> impl Stream<Item = Result<DownloadOutcome<S3Location>, Error>> + Send + '_ {
-        let files = async_stream::try_stream! { yield file; };
+    ) -> impl Stream<Item = DownloadOutcome<S3Location>> + Send + '_ {
         downloads::drive(
             &self.transport,
             &self.primary_location_src,
-            files,
+            single_file(file),
             S3Dest {
                 client: s3,
                 bucket: bucket.into(),
@@ -148,7 +151,7 @@ impl WasapiClient {
         s3: AwsS3Client,
         bucket: impl Into<String>,
         prefix: Option<String>,
-    ) -> impl Stream<Item = Result<DownloadOutcome<S3Location>, Error>> + Send + '_ {
+    ) -> impl Stream<Item = DownloadOutcome<S3Location>> + Send + '_ {
         downloads::drive(
             &self.transport,
             &self.primary_location_src,
@@ -198,6 +201,10 @@ impl WasapiClient {
             .find(|location| location.starts_with(&self.primary_location_src))
             .map(String::as_str)
     }
+}
+
+fn single_file(file: WasapiFile) -> impl Stream<Item = Result<WasapiFile, Error>> + Send {
+    async_stream::try_stream! { yield file; }
 }
 
 #[cfg(test)]

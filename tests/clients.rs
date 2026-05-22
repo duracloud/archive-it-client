@@ -6,7 +6,7 @@ use archive_it_client::{
     Config, DownloadOutcome, Error, PageOpts, PartnerClient, PublicClient, USER_AGENT,
     WasapiClient, WebdataQuery, sha1_hex,
 };
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt};
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use tempfile::TempDir;
@@ -23,13 +23,14 @@ fn config(server: &MockServer) -> Config {
     cfg
 }
 
-async fn drain_download<L>(
-    stream: impl Stream<Item = Result<DownloadOutcome<L>, Error>>,
-) -> Result<(), Error> {
+async fn drain_download<L>(stream: impl Stream<Item = DownloadOutcome<L>>) -> Result<(), Error> {
     let mut s = pin!(stream);
-    while let Some(outcome) = s.try_next().await? {
-        if let DownloadOutcome::Failed { error, .. } = outcome {
-            return Err(error);
+    while let Some(outcome) = s.next().await {
+        match outcome {
+            DownloadOutcome::Failed { error, .. } | DownloadOutcome::StreamFailed { error } => {
+                return Err(error);
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -834,8 +835,6 @@ async fn download_succeeds_without_sha1_checksum() {
 
 #[tokio::test]
 async fn download_collection_emits_downloaded_unverified_and_continues() {
-    use futures::TryStreamExt;
-
     let server = MockServer::start().await;
     let mut missing = wasapi_file_at(&server, b"x");
     missing.filename = "missing-sha1.warc.gz".into();
@@ -878,9 +877,8 @@ async fn download_collection_emits_downloaded_unverified_and_continues() {
             },
             dir.path(),
         )
-        .try_collect()
-        .await
-        .unwrap();
+        .collect()
+        .await;
 
     assert!(outcomes.iter().any(|o| matches!(
         o,
@@ -904,8 +902,6 @@ async fn download_collection_emits_downloaded_unverified_and_continues() {
 
 #[tokio::test]
 async fn download_collection_writes_files_and_emits_downloaded() {
-    use futures::TryStreamExt;
-
     let server = MockServer::start().await;
     let content = b"warc bytes";
     let file = wasapi_file_at(&server, content);
@@ -936,9 +932,8 @@ async fn download_collection_writes_files_and_emits_downloaded() {
             },
             dir.path(),
         )
-        .try_collect()
-        .await
-        .unwrap();
+        .collect()
+        .await;
 
     assert!(
         outcomes
@@ -957,8 +952,6 @@ async fn download_collection_writes_files_and_emits_downloaded() {
 
 #[tokio::test]
 async fn download_collection_progress_event_carries_received_and_total() {
-    use futures::TryStreamExt;
-
     let server = MockServer::start().await;
     let content = b"warc bytes";
     let file = wasapi_file_at(&server, content);
@@ -988,9 +981,8 @@ async fn download_collection_progress_event_carries_received_and_total() {
             },
             dir.path(),
         )
-        .try_collect()
-        .await
-        .unwrap();
+        .collect()
+        .await;
 
     let progress = outcomes
         .iter()
@@ -1007,8 +999,6 @@ async fn download_collection_progress_event_carries_received_and_total() {
 
 #[tokio::test]
 async fn download_collection_skips_existing_files_with_matching_sha1() {
-    use futures::TryStreamExt;
-
     let server = MockServer::start().await;
     let content = b"warc bytes";
     let file = wasapi_file_at(&server, content);
@@ -1036,9 +1026,8 @@ async fn download_collection_skips_existing_files_with_matching_sha1() {
             },
             dir.path(),
         )
-        .try_collect()
-        .await
-        .unwrap();
+        .collect()
+        .await;
 
     assert_eq!(outcomes.len(), 1);
     assert!(matches!(outcomes[0], DownloadOutcome::Skipped { .. }));
@@ -1053,8 +1042,6 @@ async fn download_collection_skips_existing_files_with_matching_sha1() {
 
 #[tokio::test]
 async fn download_collection_creates_missing_directory() {
-    use futures::TryStreamExt;
-
     let server = MockServer::start().await;
     let content = b"warc bytes";
     let file = wasapi_file_at(&server, content);
@@ -1087,12 +1074,55 @@ async fn download_collection_creates_missing_directory() {
             },
             &nested,
         )
-        .try_collect()
-        .await
-        .unwrap();
+        .collect()
+        .await;
 
     assert!(nested.is_dir());
     assert!(nested.join("ARCHIVEIT-1.warc.gz").exists());
+}
+
+#[tokio::test]
+async fn download_collection_reports_listing_error_as_stream_failed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/webdata"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let outcomes: Vec<_> = wasapi_download_client(&server)
+        .download_collection(WebdataQuery::default(), dir.path())
+        .collect()
+        .await;
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(
+        &outcomes[0],
+        DownloadOutcome::StreamFailed { error: Error::Status(s) } if s.as_u16() == 503
+    ));
+}
+
+#[tokio::test]
+async fn download_collection_reports_preflight_error_as_stream_failed() {
+    let server = MockServer::start().await;
+    let root = TempDir::new().unwrap();
+    let not_a_dir = root.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"file").unwrap();
+
+    let outcomes: Vec<_> = wasapi_download_client(&server)
+        .download_collection(WebdataQuery::default(), &not_a_dir)
+        .collect()
+        .await;
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(
+        &outcomes[0],
+        DownloadOutcome::StreamFailed {
+            error: Error::Io(_)
+        }
+    ));
 }
 
 #[tokio::test]
