@@ -14,7 +14,6 @@ pub(crate) struct Transport {
     backoff: Duration,
     base_url: Url,
     json_client: reqwest::Client,
-    download_client: reqwest::Client,
     creds: Option<(String, String)>,
     max_attempts: u32,
 }
@@ -25,26 +24,13 @@ impl Transport {
             .user_agent(USER_AGENT)
             .read_timeout(cfg.timeout)
             .build()?;
-        let download_client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .read_timeout(cfg.download_timeout)
-            .build()?;
         Ok(Self {
             backoff: cfg.backoff,
             base_url: Url::parse(&cfg.base_url)?,
             json_client,
-            download_client,
             creds,
             max_attempts: cfg.max_attempts.max(1),
         })
-    }
-
-    pub(crate) fn backoff(&self) -> Duration {
-        self.backoff
-    }
-
-    pub(crate) fn max_attempts(&self) -> u32 {
-        self.max_attempts
     }
 
     pub(crate) async fn get_json<Q, T>(&self, path: &str, query: &Q) -> Result<T, Error>
@@ -54,20 +40,10 @@ impl Transport {
     {
         let url = self.base_url.join(path)?;
         self.retry(|| async {
-            let resp = self.attempt(&self.json_client, &url, query, None).await?;
+            let resp = self.attempt(&url, query).await?;
             Ok::<T, Error>(resp.json().await?)
         })
         .await
-    }
-
-    pub(crate) async fn get_response_range(
-        &self,
-        url: Url,
-        from: u64,
-    ) -> Result<reqwest::Response, Error> {
-        let range = if from > 0 { Some(from) } else { None };
-        self.retry(|| self.attempt(&self.download_client, &url, &(), range))
-            .await
     }
 
     async fn retry<F, Fut, T>(&self, mut op: F) -> Result<T, Error>
@@ -96,20 +72,11 @@ impl Transport {
         }
     }
 
-    async fn attempt<Q>(
-        &self,
-        client: &reqwest::Client,
-        url: &Url,
-        query: &Q,
-        range_from: Option<u64>,
-    ) -> Result<reqwest::Response, Error>
+    async fn attempt<Q>(&self, url: &Url, query: &Q) -> Result<reqwest::Response, Error>
     where
         Q: Serialize + ?Sized,
     {
-        let mut req = client.get(url.clone()).query(query);
-        if let Some(from) = range_from {
-            req = req.header(reqwest::header::RANGE, format!("bytes={}-", from));
-        }
+        let mut req = self.json_client.get(url.clone()).query(query);
         if let Some((u, p)) = &self.creds {
             req = req.basic_auth(u, Some(p));
         }
@@ -149,7 +116,10 @@ where
     }
 }
 
-pub(crate) fn is_retryable(err: &Error) -> bool {
+// Retry classification for the API transport. Intentionally a local copy rather
+// than a shared import from `transfer`: the JSON API layer must not depend on
+// the (extraction-candidate) transfer engine.
+fn is_retryable(err: &Error) -> bool {
     match err {
         Error::Request(e) => e.is_timeout() || e.is_connect(),
         Error::Status(s) => s.is_server_error() || *s == reqwest::StatusCode::TOO_MANY_REQUESTS,

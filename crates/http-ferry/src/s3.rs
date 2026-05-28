@@ -1,4 +1,4 @@
-//! S3 destination for WASAPI downloads.
+//! S3 multipart-upload sink.
 //!
 //! Multipart-upload loop driven by [`aws_sdk_s3::Client`]. The base SDK
 //! does not auto-manage multipart, so the `Sink` impl below explicitly
@@ -10,16 +10,17 @@
 //! (the AWS default). After completion the at-rest object carries a
 //! crc64nvme — that's the integrity guarantee.
 //!
-//! When a sha1 is supplied via `WasapiFile::checksums.sha1`, we record
-//! it on the object as user metadata so subsequent runs can compare it
-//! for skip-on-match decisions. sha1 is optional; crc64nvme is not.
+//! When a [`Checksum`] is supplied, we record it on the object as user
+//! metadata (keyed by algorithm) so subsequent runs can compare it for
+//! skip-on-match decisions. The caller-supplied checksum is optional;
+//! crc64nvme is not.
 //!
 //! # Skip rules
 //!
-//! - WASAPI sha1 is Some, object has metadata sha1: skip when they match.
-//! - WASAPI sha1 is Some, object lacks metadata sha1: fall back to size.
-//! - WASAPI sha1 is None: skip when the existing object's size matches
-//!   `file.size`. Without a checksum, size is the only cheap server-side
+//! - checksum is Some, object has matching-algorithm metadata: skip when equal.
+//! - checksum is Some, object lacks that metadata: fall back to size.
+//! - checksum is None: skip when the existing object's size matches
+//!   `target.size`. Without a checksum, size is the only cheap server-side
 //!   evidence that the upload would be redundant — re-uploading a
 //!   multi-GB WARC every run is the alternative.
 //!
@@ -40,11 +41,14 @@
 //!
 //! # Aborted multipart uploads
 //!
-//! Interrupted downloads leave an in-progress multipart upload on S3.
-//! We do not auto-abort on Drop or on permanent error: Rust has no
-//! AsyncDrop and best-effort async cleanup from sync paths is brittle.
-//! Configure an `AbortIncompleteMultipartUpload` lifecycle rule on the
-//! target bucket to garbage-collect them.
+//! The multipart upload is created lazily on the first `write_chunk`, so a
+//! source failure before any bytes arrive (404, bad status, checksum
+//! mismatch) leaves nothing on S3. Once bytes start flowing, an interrupted
+//! download does leave an in-progress multipart upload: we do not auto-abort
+//! on Drop or on permanent error, because Rust has no AsyncDrop and
+//! best-effort async cleanup from sync paths is brittle. Configure an
+//! `AbortIncompleteMultipartUpload` lifecycle rule on the target bucket to
+//! garbage-collect them.
 
 use std::fmt;
 
@@ -53,34 +57,29 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
-use sha1::{Digest, Sha1};
 
-use crate::Error;
-use crate::downloads::{DownloadLocation, Prepared, Sink, SinkFactory};
-use crate::models::wasapi::WasapiFile;
+use crate::{Checksum, DownloadLocation, Error, Hasher, Prepared, Sink, SinkFactory, Target};
 
-// TODO: consider making the minimum part size configurable via a builder on
-// `WasapiClient` or an `S3SinkConfig`. 8 MiB is a reasonable floor; S3's
-// minimum (except the last part) is 5 MiB.
+// TODO: consider making the minimum part size configurable on `S3Dest`. 8 MiB
+// is a reasonable floor; S3's minimum (except the last part) is 5 MiB.
 const MIN_PART_SIZE: usize = 8 * 1024 * 1024;
 const MAX_PARTS: u64 = 10_000;
-const SHA1_METADATA_KEY: &str = "sha1";
 
-/// Uploads each file to `bucket` under `{prefix}{file.filename}`.
-pub(crate) struct S3Dest {
-    pub(crate) client: Client,
-    pub(crate) bucket: String,
-    pub(crate) prefix: Option<String>,
+/// Uploads each file to `bucket` under `{prefix}{name}` via S3 multipart upload.
+pub struct S3Dest {
+    pub client: Client,
+    pub bucket: String,
+    pub prefix: Option<String>,
 }
 
 impl SinkFactory for S3Dest {
     type Sink = S3Sink;
     type Location = S3Location;
 
-    async fn make(&mut self, file: &WasapiFile) -> Result<S3Sink, Error> {
+    async fn make(&mut self, target: Target<'_>) -> Result<S3Sink, Error> {
         let key = match &self.prefix {
-            Some(p) => format!("{p}{}", file.filename),
-            None => file.filename.clone(),
+            Some(p) => format!("{p}{}", target.name),
+            None => target.name.to_owned(),
         };
         let target = S3Location {
             bucket: self.bucket.clone(),
@@ -109,16 +108,21 @@ impl fmt::Display for S3Location {
     }
 }
 
-pub(crate) struct S3Sink {
+pub struct S3Sink {
     client: Client,
     target: S3Location,
     part_size: usize,
-    sha1_meta: Option<String>,
+    checksum: Option<Checksum>,
     state: SinkState,
 }
 
 enum SinkState {
+    /// Constructed, not yet prepared.
     Idle,
+    /// Prepared and committed to uploading, but no multipart upload has been
+    /// created yet. The MPU is created lazily on the first `write_chunk`, so a
+    /// source error before any bytes arrive leaves no incomplete upload on S3.
+    Pending,
     Uploading {
         upload_id: String,
         buffer: Vec<u8>,
@@ -133,7 +137,7 @@ impl S3Sink {
             client,
             target,
             part_size: MIN_PART_SIZE,
-            sha1_meta: None,
+            checksum: None,
             state: SinkState::Idle,
         }
     }
@@ -145,8 +149,8 @@ impl S3Sink {
             .bucket(&self.target.bucket)
             .key(&self.target.key)
             .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme);
-        if let Some(s) = &self.sha1_meta {
-            req = req.metadata(SHA1_METADATA_KEY, s);
+        if let Some(c) = &self.checksum {
+            req = req.metadata(c.algorithm(), c.hex());
         }
         let out = req.send().await.map_err(|e| Error::S3(Box::new(e)))?;
         out.upload_id
@@ -157,9 +161,15 @@ impl S3Sink {
 impl Sink for S3Sink {
     type Location = S3Location;
 
-    async fn prepare(&mut self, file: &WasapiFile) -> Result<Prepared<Self::Location>, Error> {
-        let existing = head_existing(&self.client, &self.target.bucket, &self.target.key).await?;
-        if should_skip(file.checksums.sha1.as_deref(), file.size, existing.as_ref()) {
+    async fn prepare(&mut self, target: Target<'_>) -> Result<Prepared<Self::Location>, Error> {
+        let existing = head_existing(
+            &self.client,
+            &self.target.bucket,
+            &self.target.key,
+            target.checksum,
+        )
+        .await?;
+        if should_skip(target.checksum, target.size, existing.as_ref()) {
             return Ok(Prepared::Skip {
                 location: self.target.clone(),
             });
@@ -167,32 +177,38 @@ impl Sink for S3Sink {
 
         // Reject zero-byte uploads only after the skip check, so an existing
         // zero-byte object that already matches can still be skipped.
-        if file.size == 0 {
+        if target.size == 0 {
             return Err(Error::S3(
                 format!(
                     "refusing to upload zero-byte file {} via multipart",
-                    file.filename
+                    target.name
                 )
                 .into(),
             ));
         }
-        self.part_size = part_size_for(file.size);
+        self.part_size = part_size_for(target.size);
 
-        self.sha1_meta = file.checksums.sha1.clone();
-        let upload_id = self.create_multipart_upload().await?;
-        self.state = SinkState::Uploading {
-            upload_id,
-            buffer: Vec::with_capacity(self.part_size),
-            next_part_number: 1,
-            parts: Vec::new(),
-        };
+        self.checksum = target.checksum.cloned();
+        // Defer CreateMultipartUpload to the first write_chunk: if the source
+        // fetch fails (404, bad status, checksum mismatch) before any bytes are
+        // written, no incomplete upload is left behind.
+        self.state = SinkState::Pending;
         Ok(Prepared::Resume {
             received: 0,
-            partial_sha1: Sha1::new(),
+            partial: Hasher::for_checksum(target.checksum),
         })
     }
 
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), Error> {
+        if matches!(self.state, SinkState::Pending) {
+            let upload_id = self.create_multipart_upload().await?;
+            self.state = SinkState::Uploading {
+                upload_id,
+                buffer: Vec::with_capacity(self.part_size),
+                next_part_number: 1,
+                parts: Vec::new(),
+            };
+        }
         let SinkState::Uploading {
             upload_id,
             buffer,
@@ -220,39 +236,36 @@ impl Sink for S3Sink {
     }
 
     async fn restart(&mut self) -> Result<(), Error> {
-        let prev_upload_id = match &self.state {
-            SinkState::Uploading { upload_id, .. } => Some(upload_id.clone()),
-            SinkState::Idle => None,
-        };
-        if let Some(id) = prev_upload_id {
+        if let SinkState::Uploading { upload_id, .. } = &self.state {
             let _ = self
                 .client
                 .abort_multipart_upload()
                 .bucket(&self.target.bucket)
                 .key(&self.target.key)
-                .upload_id(id)
+                .upload_id(upload_id.clone())
                 .send()
                 .await;
         }
-        let upload_id = self.create_multipart_upload().await?;
-        self.state = SinkState::Uploading {
-            upload_id,
-            buffer: Vec::with_capacity(self.part_size),
-            next_part_number: 1,
-            parts: Vec::new(),
-        };
+        // Drop back to Pending; the next write_chunk creates a fresh upload.
+        self.state = SinkState::Pending;
         Ok(())
     }
 
     async fn finalize(self) -> Result<Self::Location, Error> {
-        let SinkState::Uploading {
-            upload_id,
-            buffer,
-            next_part_number,
-            mut parts,
-        } = self.state
-        else {
-            panic!("finalize before prepare");
+        let (upload_id, buffer, next_part_number, mut parts) = match self.state {
+            SinkState::Uploading {
+                upload_id,
+                buffer,
+                next_part_number,
+                parts,
+            } => (upload_id, buffer, next_part_number, parts),
+            // Pending means no byte was ever written, so no upload exists to
+            // complete. (The engine rejects zero-byte files and catches a short
+            // stream as a size mismatch before finalize, so this is defensive.)
+            SinkState::Pending => {
+                return Err(Error::S3("finalize called with no parts uploaded".into()));
+            }
+            SinkState::Idle => panic!("finalize before prepare"),
         };
 
         if !buffer.is_empty() {
@@ -323,7 +336,10 @@ async fn upload_part(
 
 #[derive(Debug)]
 struct ExistingObject {
-    sha1: Option<String>,
+    /// Stored checksum of the same algorithm as the expected one, if the
+    /// object carried that metadata key. `None` when no checksum was expected
+    /// or the key was absent.
+    checksum: Option<Checksum>,
     size: u64,
 }
 
@@ -331,16 +347,18 @@ async fn head_existing(
     client: &Client,
     bucket: &str,
     key: &str,
+    expected: Option<&Checksum>,
 ) -> Result<Option<ExistingObject>, Error> {
     match client.head_object().bucket(bucket).key(key).send().await {
         Ok(out) => {
-            let sha1 = out
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get(SHA1_METADATA_KEY))
-                .cloned();
+            let checksum = expected.and_then(|exp| {
+                out.metadata
+                    .as_ref()
+                    .and_then(|m| m.get(exp.algorithm()))
+                    .map(|v| exp.with_value(v.clone()))
+            });
             let size = out.content_length.unwrap_or(0).max(0) as u64;
-            Ok(Some(ExistingObject { sha1, size }))
+            Ok(Some(ExistingObject { checksum, size }))
         }
         Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
             Ok(None)
@@ -353,17 +371,13 @@ fn part_size_for(file_size: u64) -> usize {
     file_size.div_ceil(MAX_PARTS).max(MIN_PART_SIZE as u64) as usize
 }
 
-fn should_skip(
-    wasapi_sha1: Option<&str>,
-    file_size: u64,
-    existing: Option<&ExistingObject>,
-) -> bool {
-    match (wasapi_sha1, existing) {
-        (Some(expected), Some(obj)) => match obj.sha1.as_deref() {
-            Some(s) => s == expected,
-            None => obj.size == file_size,
+fn should_skip(expected: Option<&Checksum>, size: u64, existing: Option<&ExistingObject>) -> bool {
+    match (expected, existing) {
+        (Some(expected), Some(obj)) => match &obj.checksum {
+            Some(stored) => stored.hex() == expected.hex(),
+            None => obj.size == size,
         },
-        (None, Some(obj)) => obj.size == file_size,
+        (None, Some(obj)) => obj.size == size,
         _ => false,
     }
 }
@@ -371,7 +385,6 @@ fn should_skip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::wasapi::{Checksums, WasapiFile};
     use aws_credential_types::Credentials;
     use aws_sdk_s3::config::{BehaviorVersion, Region};
     use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
@@ -412,23 +425,8 @@ mod tests {
             .unwrap()
     }
 
-    fn mk_file(filename: &str, size: u64, sha1: Option<&str>) -> WasapiFile {
-        WasapiFile {
-            filename: filename.into(),
-            filetype: "warc".into(),
-            checksums: Checksums {
-                sha1: sha1.map(String::from),
-                md5: None,
-            },
-            account: 1,
-            size,
-            collection: 1,
-            crawl: None,
-            crawl_time: None,
-            crawl_start: None,
-            store_time: "2025-01-01T00:00:00Z".into(),
-            locations: vec![],
-        }
+    fn sha1(hex: &str) -> Checksum {
+        Checksum::Sha1(hex.into())
     }
 
     const CREATE_MPU_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -497,54 +495,54 @@ mod tests {
     }
 
     #[test]
-    fn should_skip_when_wasapi_sha1_matches_object_metadata_sha1() {
+    fn should_skip_when_expected_checksum_matches_object_metadata() {
         let existing = ExistingObject {
-            sha1: Some("abc".into()),
+            checksum: Some(sha1("abc")),
             size: 100,
         };
-        assert!(should_skip(Some("abc"), 100, Some(&existing)));
+        assert!(should_skip(Some(&sha1("abc")), 100, Some(&existing)));
     }
 
     #[test]
-    fn should_not_skip_when_wasapi_sha1_differs_from_object_metadata_sha1() {
+    fn should_not_skip_when_expected_checksum_differs_from_object_metadata() {
         let existing = ExistingObject {
-            sha1: Some("xxx".into()),
+            checksum: Some(sha1("xxx")),
             size: 100,
         };
-        assert!(!should_skip(Some("abc"), 100, Some(&existing)));
+        assert!(!should_skip(Some(&sha1("abc")), 100, Some(&existing)));
     }
 
     #[test]
-    fn should_skip_when_wasapi_has_sha1_object_lacks_sha1_and_sizes_match() {
+    fn should_skip_when_expected_checksum_object_lacks_checksum_and_sizes_match() {
         let existing = ExistingObject {
-            sha1: None,
+            checksum: None,
             size: 100,
         };
-        assert!(should_skip(Some("abc"), 100, Some(&existing)));
+        assert!(should_skip(Some(&sha1("abc")), 100, Some(&existing)));
     }
 
     #[test]
-    fn should_not_skip_when_wasapi_has_sha1_object_lacks_sha1_and_sizes_differ() {
+    fn should_not_skip_when_expected_checksum_object_lacks_checksum_and_sizes_differ() {
         let existing = ExistingObject {
-            sha1: None,
+            checksum: None,
             size: 99,
         };
-        assert!(!should_skip(Some("abc"), 100, Some(&existing)));
+        assert!(!should_skip(Some(&sha1("abc")), 100, Some(&existing)));
     }
 
     #[test]
-    fn should_skip_when_wasapi_has_no_sha1_and_object_size_matches() {
+    fn should_skip_when_no_expected_checksum_and_object_size_matches() {
         let existing = ExistingObject {
-            sha1: None,
+            checksum: None,
             size: 100,
         };
         assert!(should_skip(None, 100, Some(&existing)));
     }
 
     #[test]
-    fn should_not_skip_when_wasapi_has_no_sha1_and_object_size_differs() {
+    fn should_not_skip_when_no_expected_checksum_and_object_size_differs() {
         let existing = ExistingObject {
-            sha1: None,
+            checksum: None,
             size: 99,
         };
         assert!(!should_skip(None, 100, Some(&existing)));
@@ -552,7 +550,7 @@ mod tests {
 
     #[test]
     fn should_not_skip_when_no_existing_object() {
-        assert!(!should_skip(Some("abc"), 100, None));
+        assert!(!should_skip(Some(&sha1("abc")), 100, None));
         assert!(!should_skip(None, 100, None));
     }
 
@@ -562,7 +560,7 @@ mod tests {
             placeholder_req(),
             head_404_response(),
         )]);
-        let result = head_existing(&make_client(&replay), "bucket", "key")
+        let result = head_existing(&make_client(&replay), "bucket", "key", Some(&sha1("x")))
             .await
             .unwrap();
         assert!(result.is_none());
@@ -574,11 +572,11 @@ mod tests {
             placeholder_req(),
             head_200_response(42, Some("deadbeef")),
         )]);
-        let obj = head_existing(&make_client(&replay), "bucket", "key")
+        let obj = head_existing(&make_client(&replay), "bucket", "key", Some(&sha1("x")))
             .await
             .unwrap()
             .expect("expected Some(ExistingObject)");
-        assert_eq!(obj.sha1.as_deref(), Some("deadbeef"));
+        assert_eq!(obj.checksum.as_ref().map(Checksum::hex), Some("deadbeef"));
         assert_eq!(obj.size, 42);
     }
 
@@ -588,11 +586,11 @@ mod tests {
             placeholder_req(),
             head_200_response(100, None),
         )]);
-        let obj = head_existing(&make_client(&replay), "bucket", "key")
+        let obj = head_existing(&make_client(&replay), "bucket", "key", Some(&sha1("x")))
             .await
             .unwrap()
             .expect("expected Some(ExistingObject)");
-        assert!(obj.sha1.is_none());
+        assert!(obj.checksum.is_none());
         assert_eq!(obj.size, 100);
     }
 
@@ -603,8 +601,13 @@ mod tests {
             head_200_response(42, Some("abc123")),
         )]);
         let mut sink = S3Sink::new(make_client(&replay), target());
+        let cs = Some(sha1("abc123"));
         let prepared = sink
-            .prepare(&mk_file("foo.warc", 42, Some("abc123")))
+            .prepare(Target {
+                name: "foo.warc",
+                size: 42,
+                checksum: cs.as_ref(),
+            })
             .await
             .unwrap();
         assert!(matches!(prepared, Prepared::Skip { .. }));
@@ -617,7 +620,14 @@ mod tests {
             head_200_response(100, None),
         )]);
         let mut sink = S3Sink::new(make_client(&replay), target());
-        let prepared = sink.prepare(&mk_file("foo.warc", 100, None)).await.unwrap();
+        let prepared = sink
+            .prepare(Target {
+                name: "foo.warc",
+                size: 100,
+                checksum: None,
+            })
+            .await
+            .unwrap();
         assert!(matches!(prepared, Prepared::Skip { .. }));
     }
 
@@ -631,7 +641,14 @@ mod tests {
             head_200_response(0, None),
         )]);
         let mut sink = S3Sink::new(make_client(&replay), target());
-        let prepared = sink.prepare(&mk_file("zero.warc", 0, None)).await.unwrap();
+        let prepared = sink
+            .prepare(Target {
+                name: "zero.warc",
+                size: 0,
+                checksum: None,
+            })
+            .await
+            .unwrap();
         assert!(matches!(prepared, Prepared::Skip { .. }));
     }
 
@@ -642,7 +659,13 @@ mod tests {
             head_404_response(),
         )]);
         let mut sink = S3Sink::new(make_client(&replay), target());
-        let result = sink.prepare(&mk_file("zero.warc", 0, None)).await;
+        let result = sink
+            .prepare(Target {
+                name: "zero.warc",
+                size: 0,
+                checksum: None,
+            })
+            .await;
         assert!(matches!(result, Err(Error::S3(_))));
     }
 
@@ -655,7 +678,13 @@ mod tests {
             ReplayEvent::new(placeholder_req(), ok_with_body(COMPLETE_MPU_BODY)),
         ]);
         let mut sink = S3Sink::new(make_client(&replay), target());
-        sink.prepare(&mk_file("foo", 5, None)).await.unwrap();
+        sink.prepare(Target {
+            name: "foo",
+            size: 5,
+            checksum: None,
+        })
+        .await
+        .unwrap();
         sink.write_chunk(b"hello").await.unwrap();
         let location = sink.finalize().await.unwrap();
         assert_eq!(location.bucket, "bucket");
@@ -676,9 +705,13 @@ mod tests {
             ReplayEvent::new(placeholder_req(), ok_with_body(COMPLETE_MPU_BODY)),
         ]);
         let mut sink = S3Sink::new(make_client(&replay), target());
-        sink.prepare(&mk_file("big", total as u64, None))
-            .await
-            .unwrap();
+        sink.prepare(Target {
+            name: "big",
+            size: total as u64,
+            checksum: None,
+        })
+        .await
+        .unwrap();
         // Feed in multiple chunks that together cross both part boundaries.
         let chunk = vec![b'x'; part_size];
         sink.write_chunk(&chunk).await.unwrap();
@@ -697,7 +730,13 @@ mod tests {
             ReplayEvent::new(placeholder_req(), ok_with_body(COMPLETE_MPU_BODY_NO_CRC)),
         ]);
         let mut sink = S3Sink::new(make_client(&replay), target());
-        sink.prepare(&mk_file("foo", 5, None)).await.unwrap();
+        sink.prepare(Target {
+            name: "foo",
+            size: 5,
+            checksum: None,
+        })
+        .await
+        .unwrap();
         sink.write_chunk(b"hello").await.unwrap();
         let err = sink.finalize().await.unwrap_err();
         assert!(matches!(err, Error::S3(_)));

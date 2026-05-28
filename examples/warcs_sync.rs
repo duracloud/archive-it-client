@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::pin::pin;
 
 use archive_it_client::models::wasapi::{Checksums, WasapiFile};
-use archive_it_client::{DownloadOutcome, Error, WasapiClient};
+use archive_it_client::{DownloadOutcome, WasapiClient, http_ferry};
 use aws_config::BehaviorVersion;
 use csv::ReaderBuilder;
 use futures::StreamExt;
@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DownloadOutcome::Downloaded { .. } => uploaded += 1,
                 DownloadOutcome::Skipped { .. } => skipped += 1,
                 DownloadOutcome::Failed { error, .. } => {
-                    if matches!(error, Error::NotFound(_)) {
+                    if matches!(error, http_ferry::Error::NotFound(_)) {
                         wasapi_missing += 1;
                     } else {
                         failed += 1;

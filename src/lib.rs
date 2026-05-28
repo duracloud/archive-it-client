@@ -3,7 +3,6 @@
 use std::fmt::Write;
 use std::time::Duration;
 
-mod downloads;
 mod error;
 mod http;
 pub mod models;
@@ -11,8 +10,20 @@ pub mod partner;
 pub mod public;
 pub mod wasapi;
 
-pub use downloads::{DownloadLocation, DownloadOutcome};
 pub use error::Error;
+
+/// The transfer engine powering the `download*` methods. Re-exported so callers
+/// can name [`http_ferry::Error`] — the error carried by [`DownloadOutcome`] —
+/// and the [`DownloadLocation`] trait.
+pub use http_ferry;
+pub use http_ferry::DownloadLocation;
+
+/// Per-file outcome of a `WasapiClient::download*` stream. An alias for the
+/// transfer engine's [`Outcome`](http_ferry::Outcome) carrying a
+/// [`WasapiFile`](models::wasapi::WasapiFile); its `error` field is an
+/// [`http_ferry::Error`].
+pub type DownloadOutcome<L = std::path::PathBuf> =
+    http_ferry::Outcome<crate::models::wasapi::WasapiFile, L>;
 
 pub use partner::PartnerClient;
 pub use public::PublicClient;
@@ -26,7 +37,7 @@ pub use wasapi::{WasapiClient, WebdataQuery};
 /// optional key prefix. Each upload's resolved [`S3Location`](s3::S3Location)
 /// is reported back via `DownloadOutcome`.
 pub mod s3 {
-    pub use crate::downloads::s3::S3Location;
+    pub use http_ferry::s3::S3Location;
 }
 
 pub const USER_AGENT: &str = concat!("Archive-It-Client (", env!("CARGO_PKG_VERSION"), ")");

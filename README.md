@@ -166,7 +166,9 @@ by file size. Every download method returns a `Stream` of `DownloadOutcome`
 events — `Progress` / `Downloaded` / `Skipped` / `Failed` per file, plus
 `StreamFailed` for errors that occur before a file is available — so callers
 can render progress and react to failures uniformly, whether they're
-downloading one file or a whole collection.
+downloading one file or a whole collection. The `error` carried by `Failed`
+and `StreamFailed` is an `http_ferry::Error` (re-exported as
+`archive_it_client::http_ferry::Error`), not `archive_it_client::Error`.
 
 ```rust,no_run
 use std::pin::pin;

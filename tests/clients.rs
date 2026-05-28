@@ -4,7 +4,7 @@ use std::time::Duration;
 use archive_it_client::models::wasapi::{Checksums, WasapiFile};
 use archive_it_client::{
     Config, DownloadOutcome, Error, PageOpts, PartnerClient, PublicClient, USER_AGENT,
-    WasapiClient, WebdataQuery, sha1_hex,
+    WasapiClient, WebdataQuery, http_ferry, sha1_hex,
 };
 use futures::{Stream, StreamExt};
 use serde_json::json;
@@ -23,7 +23,9 @@ fn config(server: &MockServer) -> Config {
     cfg
 }
 
-async fn drain_download<L>(stream: impl Stream<Item = DownloadOutcome<L>>) -> Result<(), Error> {
+async fn drain_download<L>(
+    stream: impl Stream<Item = DownloadOutcome<L>>,
+) -> Result<(), http_ferry::Error> {
     let mut s = pin!(stream);
     while let Some(outcome) = s.next().await {
         match outcome {
@@ -467,7 +469,7 @@ async fn download_returns_size_mismatch() {
 
     assert!(matches!(
         err,
-        Error::SizeMismatch {
+        http_ferry::Error::SizeMismatch {
             expected: 9999,
             actual: 14,
             ..
@@ -496,7 +498,7 @@ async fn download_returns_checksum_mismatch() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::ChecksumMismatch { .. }));
+    assert!(matches!(err, http_ferry::Error::ChecksumMismatch { .. }));
     assert!(!out.exists());
 }
 
@@ -562,7 +564,10 @@ async fn download_rejects_resumed_response_with_mismatched_content_range_start()
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::InvalidRangeResponse { .. }));
+    assert!(matches!(
+        err,
+        http_ferry::Error::InvalidRangeResponse { .. }
+    ));
     assert_eq!(std::fs::read(&part_path).unwrap(), prefix);
     assert!(!final_path.exists());
 }
@@ -592,7 +597,10 @@ async fn download_rejects_resumed_response_without_content_range() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::InvalidRangeResponse { .. }));
+    assert!(matches!(
+        err,
+        http_ferry::Error::InvalidRangeResponse { .. }
+    ));
     assert_eq!(std::fs::read(&part_path).unwrap(), prefix);
     assert!(!final_path.exists());
 }
@@ -626,7 +634,10 @@ async fn download_rejects_resumed_response_with_mismatched_content_range_total()
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::InvalidRangeResponse { .. }));
+    assert!(matches!(
+        err,
+        http_ferry::Error::InvalidRangeResponse { .. }
+    ));
     assert_eq!(std::fs::read(&part_path).unwrap(), prefix);
     assert!(!final_path.exists());
 }
@@ -699,7 +710,7 @@ async fn download_errors_on_complete_part_with_wrong_sha1() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::ChecksumMismatch { .. }));
+    assert!(matches!(err, http_ferry::Error::ChecksumMismatch { .. }));
     assert!(!final_path.exists());
 }
 
@@ -741,7 +752,15 @@ async fn download_returns_primary_location_missing() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::PrimaryLocationMissing { .. }));
+    // URL resolution is a host concern, so the engine surfaces it boxed in
+    // `Source`; the original typed error is recoverable by downcast.
+    let http_ferry::Error::Source(inner) = err else {
+        panic!("expected Source, got {err:?}");
+    };
+    assert!(matches!(
+        inner.downcast_ref::<Error>(),
+        Some(Error::PrimaryLocationMissing { .. })
+    ));
 }
 
 fn wasapi_file_json(f: &WasapiFile) -> serde_json::Value {
@@ -1100,7 +1119,7 @@ async fn download_collection_reports_listing_error_as_stream_failed() {
     assert_eq!(outcomes.len(), 1);
     assert!(matches!(
         &outcomes[0],
-        DownloadOutcome::StreamFailed { error: Error::Status(s) } if s.as_u16() == 503
+        DownloadOutcome::StreamFailed { error: http_ferry::Error::Status(s) } if s.as_u16() == 503
     ));
 }
 
@@ -1120,7 +1139,7 @@ async fn download_collection_reports_preflight_error_as_stream_failed() {
     assert!(matches!(
         &outcomes[0],
         DownloadOutcome::StreamFailed {
-            error: Error::Io(_)
+            error: http_ferry::Error::Io(_)
         }
     ));
 }

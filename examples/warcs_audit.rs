@@ -1,6 +1,6 @@
 // Match-check report against an S3 bucket using `warcs.csv` as the source
 // of truth. For each (filename, sha1, size) row, HEAD the object and
-// classify it the way `crate::downloads::s3::should_skip` would:
+// classify it the way http-ferry's S3 sink (its `should_skip`) would:
 //   - matched (sha1):  object's sha1 metadata == WASAPI sha1
 //   - matched (size):  no sha1 metadata, but content_length == WASAPI size
 //   - unmatched:       object exists but neither matches (sink would re-upload)

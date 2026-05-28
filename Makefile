@@ -3,10 +3,10 @@
 ci: fmt clippy test
 
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	@cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 fmt:
-	cargo fmt --check
+	@cargo fmt --all --check
 
 publish:
 	@git diff-index --quiet HEAD -- || { \
@@ -20,4 +20,4 @@ publish:
 		&& git push origin "v$$VERSION"
 
 test:
-	cargo test
+	@cargo test --workspace --all-features

@@ -16,18 +16,36 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify tag matches Cargo.toml version
+      - name: Verify tag matches archive-it-client version
         run: |
           TAG_VERSION=${GITHUB_REF_NAME#v}
           CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[0].version')
+            | jq -r '.packages[] | select(.name == "archive-it-client") | .version')
 
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "Tag ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
 
-      - name: Publish to crates.io
+      # archive-it-client depends on http-ferry, so the dependency must reach
+      # crates.io first. http-ferry is versioned independently of the release
+      # tag, so only publish it when its current version isn't already up.
+      - name: Publish http-ferry (dependency)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
-        run: cargo publish --locked
+        run: |
+          HF_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "http-ferry") | .version')
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: archive-it-client release workflow' \
+            "https://crates.io/api/v1/crates/http-ferry/$HF_VERSION")
+          if [ "$STATUS" = "200" ]; then
+            echo "http-ferry $HF_VERSION already published; skipping."
+          else
+            cargo publish --locked --package http-ferry
+          fi
+
+      - name: Publish archive-it-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO }}
+        run: cargo publish --locked --package archive-it-client

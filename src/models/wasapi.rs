@@ -1,3 +1,4 @@
+use http_ferry::Label;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +27,13 @@ pub struct WasapiFile {
     pub crawl_start: Option<String>,
     pub store_time: String,
     pub locations: Vec<String>,
+}
+
+/// Gives the engine a label (the filename) for `DownloadOutcome`'s `Display`.
+impl Label for WasapiFile {
+    fn label(&self) -> &str {
+        &self.filename
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
