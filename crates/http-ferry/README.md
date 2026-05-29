@@ -98,6 +98,14 @@ while let Some(outcome) = out.next().await {
 }
 ```
 
+For a complete one-file local-sink example with progress validation and required
+checksum verification:
+
+```sh
+cargo run -p http-ferry --example local_download -- \
+  https://example.com/large.bin ./out sha1:<40-hex-digest>
+```
+
 ### Adding a destination
 
 Implement [`Sink`] (per-file state machine) and [`SinkFactory`] (builds one sink
