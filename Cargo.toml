@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "archive-it-client"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Mark Cooper <gh.aftermath967@passinbox.com>"]
 description = "Rust client for Archive-It's partner API and WASAPI"
@@ -20,7 +20,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 ] }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
-http-ferry = { path = "crates/http-ferry", version = "0.1.0", features = [
+http-ferry = { path = "crates/http-ferry", version = "0.2.0", features = [
   "s3",
 ] }
 reqwest = { version = "0.12", default-features = false, features = [
