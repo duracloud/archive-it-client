@@ -1,13 +1,13 @@
 [package]
 name = "http-ferry"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
-authors = ["Mark Cooper <gh.aftermath967@passinbox.com>"]
+authors = ["Mark Cooper <mark.cooper@lyrasis.org>"]
 description = "Resumable, checksum-verified streaming byte transfer from HTTP sources to pluggable sinks"
 keywords = ["download", "http", "resume", "s3", "streaming"]
 categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mark-cooper/archive-it-client"
+repository = "https://github.com/duracloud/archive-it-client"
 
 [dependencies]
 async-stream = "0.3"
