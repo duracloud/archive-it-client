@@ -23,9 +23,10 @@ futures-util = { version = "0.3", default-features = false }
 http-ferry = { path = "crates/http-ferry", version = "0.2.0", features = [
   "s3",
 ] }
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
   "json",
-  "rustls-tls",
+  "query",
+  "rustls",
   "stream",
 ] }
 serde = { version = "1", features = ["derive"] }
