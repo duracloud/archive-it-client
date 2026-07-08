@@ -66,6 +66,11 @@ pub struct Config {
     pub download_timeout: Duration,
     pub max_attempts: u32,
     pub backoff: Duration,
+    /// Extra headers sent with every request, including WARC downloads,
+    /// e.g. an access token like `("X-Custom-Header", "token-...")`.
+    /// Values are marked sensitive so they are redacted from debug output.
+    /// Invalid names or values are rejected when the client is constructed.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Config {
@@ -76,6 +81,7 @@ impl Config {
             download_timeout: Duration::from_secs(30),
             max_attempts: 3,
             backoff: Duration::from_millis(250),
+            headers: Vec::new(),
         }
     }
 

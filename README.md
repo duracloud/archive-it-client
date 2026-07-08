@@ -61,6 +61,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`Config::headers` attaches custom headers to every request the client makes,
+including WARC downloads, for example an access token issued to your
+account:
+
+```rust,no_run
+use archive_it_client::{Config, WasapiClient};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = Config::wasapi();
+    cfg.headers.push(("X-Custom-Header".into(), "token-123".into()));
+    let client = WasapiClient::with_config("user", "pass", cfg)?;
+
+    Ok(())
+}
+```
+
+Header values are marked sensitive so they are redacted from debug/log output,
+and invalid names or values are rejected when the client is constructed.
+
 ## Pagination
 
 There are two options: streaming for transparent pagination, per-page methods for manual

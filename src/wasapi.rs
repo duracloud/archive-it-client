@@ -10,7 +10,7 @@ use http_ferry::s3::{S3Dest, S3Location};
 use serde::Serialize;
 use url::Url;
 
-use crate::http::Transport;
+use crate::http::{Transport, header_map};
 use crate::models::wasapi::{Page, WasapiFile};
 use crate::{Config, DownloadOutcome, Error, USER_AGENT};
 
@@ -78,6 +78,7 @@ impl WasapiClient {
         let transport = Transport::new(cfg.clone(), Some(creds.clone()))?;
         let download_client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .default_headers(header_map(&cfg.headers)?)
             .read_timeout(cfg.download_timeout)
             .build()?;
         let downloader = Downloader::builder(download_client)

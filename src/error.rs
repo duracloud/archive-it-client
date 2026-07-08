@@ -6,6 +6,8 @@ use reqwest::StatusCode;
 pub enum Error {
     #[error("authenticated account list was empty")]
     Empty,
+    #[error("invalid header {name}: {reason}")]
+    InvalidHeader { name: String, reason: String },
     #[error("I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("resource not found: {0}")]

@@ -22,6 +22,7 @@ impl Transport {
     pub(crate) fn new(cfg: Config, creds: Option<(String, String)>) -> Result<Self, Error> {
         let json_client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .default_headers(header_map(&cfg.headers)?)
             .read_timeout(cfg.timeout)
             .build()?;
         Ok(Self {
@@ -90,6 +91,31 @@ impl Transport {
         }
         Ok(resp)
     }
+}
+
+/// Build the default `HeaderMap` from `Config::headers`. Values are marked
+/// sensitive so tokens are redacted from debug output; parse failures report
+/// the header name but never echo the value.
+pub(crate) fn header_map(
+    headers: &[(String, String)],
+) -> Result<reqwest::header::HeaderMap, Error> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let header_name =
+            HeaderName::from_bytes(name.as_bytes()).map_err(|e| Error::InvalidHeader {
+                name: name.clone(),
+                reason: e.to_string(),
+            })?;
+        let mut header_value = HeaderValue::from_str(value).map_err(|e| Error::InvalidHeader {
+            name: name.clone(),
+            reason: e.to_string(),
+        })?;
+        header_value.set_sensitive(true);
+        map.append(header_name, header_value);
+    }
+    Ok(map)
 }
 
 pub(crate) fn paginated<'a, F, Fut, T>(

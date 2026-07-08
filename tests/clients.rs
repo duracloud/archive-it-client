@@ -97,6 +97,65 @@ async fn partner_attaches_basic_auth() {
 }
 
 #[tokio::test]
+async fn custom_header_sent_on_api_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/account"))
+        .and(header("X-Custom-Header", "token-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cfg = config(&server);
+    cfg.headers
+        .push(("X-Custom-Header".into(), "token-123".into()));
+    let client = PublicClient::with_config(cfg).unwrap();
+    client.list_accounts(PageOpts::default()).await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_header_sent_on_download_requests() {
+    let server = MockServer::start().await;
+    let content = b"warc bytes";
+
+    Mock::given(method("GET"))
+        .and(path("/warcs/foo.warc.gz"))
+        .and(header("X-Custom-Header", "token-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cfg = wasapi_config(&server);
+    cfg.headers
+        .push(("X-Custom-Header".into(), "token-123".into()));
+    let client = WasapiClient::with_config("u", "p", cfg)
+        .unwrap()
+        .with_primary_location_src(server.uri());
+
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.warc.gz");
+    drain_download(client.download(wasapi_file_at(&server, content), &out))
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&out).unwrap(), content);
+}
+
+#[tokio::test]
+async fn invalid_custom_header_fails_at_construction() {
+    let mut cfg = Config::api();
+    cfg.headers
+        .push(("not a header name".into(), "value".into()));
+    let Err(err) = PublicClient::with_config(cfg) else {
+        panic!("expected InvalidHeader error");
+    };
+
+    assert!(matches!(err, Error::InvalidHeader { ref name, .. } if name == "not a header name"));
+}
+
+#[tokio::test]
 async fn partner_caches_self_id_across_list_calls() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
