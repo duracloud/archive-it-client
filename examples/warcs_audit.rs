@@ -291,12 +291,13 @@ async fn tag_expired(
     bucket: &str,
     key: &str,
     tagging: Tagging,
-) -> Result<(), SdkError<PutObjectTaggingError>> {
+) -> Result<(), Box<SdkError<PutObjectTaggingError>>> {
     s3.put_object_tagging()
         .bucket(bucket)
         .key(key)
         .tagging(tagging)
         .send()
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ())
+        .map_err(Box::new)
 }
