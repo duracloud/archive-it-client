@@ -1,0 +1,27 @@
+[tools]
+node = "24"
+rust = "stable"
+
+[tasks.ci]
+description = "Run formatting, lint, and test checks"
+run = [
+  'cargo fmt --all --check',
+  'cargo clippy --workspace --all-targets --all-features -- -D warnings',
+  'cargo test --workspace --all-features',
+]
+
+[tasks.clippy]
+description = "Lint the workspace"
+run = 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = 'cargo fmt --all --check'
+
+[tasks.publish]
+description = "Tag and push the current archive-it-client version"
+run = 'node scripts/publish.mjs'
+
+[tasks.test]
+description = "Test the workspace with all features"
+run = 'cargo test --workspace --all-features'
