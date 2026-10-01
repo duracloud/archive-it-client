@@ -35,10 +35,10 @@ pub struct Account {
     pub ignore_delay_option_visible: bool,
     pub warc_upload_link_visible: bool,
     pub show_longer_crawl_durations: bool,
-    pub enforce_budget: bool,
+    pub enforce_budget: Option<bool>,
 
     pub invoice_data_budget_in_gbs: u64,
-    pub ledger_data_budget_in_gbs: u64,
+    pub ledger_data_budget_in_gbs: Option<u64>,
     pub default_crawl_limit_in_gbs: Option<u64>,
     pub max_concurrent_test_crawls: u64,
     pub annual_subscription_cost: i64,
